@@ -1,9 +1,9 @@
 from dotenv import load_dotenv
 import os
 import numpy as np
+import shutil
 
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,22 +55,8 @@ OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )
 
-
-# ============================================================
-# OPENAI CLIENT
-# ============================================================
-
 client = OpenAI(
     api_key=OPENAI_API_KEY
-)
-
-
-# ============================================================
-# AI EMBEDDING MODEL
-# ============================================================
-
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
 )
 
 
@@ -82,9 +68,7 @@ windows_tesseract = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
-if os.path.exists(
-    windows_tesseract
-):
+if os.path.exists(windows_tesseract):
 
     pytesseract.pytesseract.tesseract_cmd = (
         windows_tesseract
@@ -143,6 +127,26 @@ def root():
 
 
 # ============================================================
+# CREATE OPENAI EMBEDDINGS
+# ============================================================
+
+def create_embeddings(texts):
+
+    if not texts:
+        return []
+
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+
+    return [
+        item.embedding
+        for item in response.data
+    ]
+
+
+# ============================================================
 # UPLOAD DOCUMENT
 # ============================================================
 
@@ -157,14 +161,17 @@ async def upload_document(
     global document_page_numbers
     global conversation_history
 
-
     # --------------------------------------------------------
     # Save Uploaded File
     # --------------------------------------------------------
 
+    safe_filename = os.path.basename(
+        file.filename
+    )
+
     file_path = os.path.join(
         DOCUMENT_FOLDER,
-        file.filename
+        safe_filename
     )
 
     with open(
@@ -178,7 +185,6 @@ async def upload_document(
             content
         )
 
-
     # --------------------------------------------------------
     # Open PDF
     # --------------------------------------------------------
@@ -186,7 +192,6 @@ async def upload_document(
     document = pymupdf.open(
         file_path
     )
-
 
     # --------------------------------------------------------
     # Reset Previous Data
@@ -202,13 +207,11 @@ async def upload_document(
 
     conversation_history = []
 
-
     # --------------------------------------------------------
     # Extract Text Page By Page
     # --------------------------------------------------------
 
     page_data = []
-
 
     for page_number, page in enumerate(
         document,
@@ -217,35 +220,46 @@ async def upload_document(
 
         page_text = page.get_text()
 
-
         # ----------------------------------------------------
         # OCR FOR SCANNED PAGES
         # ----------------------------------------------------
 
         if not page_text.strip():
 
-            pix = page.get_pixmap()
+            try:
 
-            image = pix.tobytes(
-                "png"
-            )
+                if (
+                    os.name == "nt"
+                    or shutil.which("tesseract")
+                ):
 
-            from PIL import Image
-            from io import BytesIO
+                    pix = page.get_pixmap()
 
-            img = Image.open(
-                BytesIO(image)
-            )
+                    image = pix.tobytes(
+                        "png"
+                    )
 
-            page_text = (
-                pytesseract.image_to_string(
-                    img
+                    from PIL import Image
+                    from io import BytesIO
+
+                    img = Image.open(
+                        BytesIO(image)
+                    )
+
+                    page_text = (
+                        pytesseract.image_to_string(
+                            img
+                        )
+                    )
+
+            except Exception as e:
+
+                print(
+                    "OCR Error:",
+                    e
                 )
-            )
-
 
         page_text = page_text.strip()
-
 
         if page_text:
 
@@ -260,7 +274,6 @@ async def upload_document(
                 page_text + "\n"
             )
 
-
     # --------------------------------------------------------
     # Page Count
     # --------------------------------------------------------
@@ -269,13 +282,7 @@ async def upload_document(
         document
     )
 
-
-    # --------------------------------------------------------
-    # Close PDF
-    # --------------------------------------------------------
-
     document.close()
-
 
     # ========================================================
     # CREATE PAGE-AWARE CHUNKS
@@ -285,11 +292,9 @@ async def upload_document(
 
     chunk_overlap = 100
 
-
     for page_number, page_text in page_data:
 
         start = 0
-
 
         while start < len(page_text):
 
@@ -302,7 +307,6 @@ async def upload_document(
                 start:end
             ].strip()
 
-
             if chunk:
 
                 document_chunks.append(
@@ -313,25 +317,37 @@ async def upload_document(
                     page_number
                 )
 
-
             start += (
                 chunk_size -
                 chunk_overlap
             )
 
-
     # ========================================================
-    # CREATE EMBEDDINGS
+    # CREATE OPENAI EMBEDDINGS
     # ========================================================
 
     if document_chunks:
 
-        document_embeddings = (
-            embedding_model.encode(
-                document_chunks
-            )
-        )
+        try:
 
+            document_embeddings = (
+                create_embeddings(
+                    document_chunks
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                "Embedding Error:",
+                e
+            )
+
+            return {
+                "filename": safe_filename,
+                "message": "Document uploaded, but embedding creation failed.",
+                "error": str(e)
+            }
 
     # ========================================================
     # RESPONSE
@@ -340,7 +356,7 @@ async def upload_document(
     return {
 
         "filename":
-            file.filename,
+            safe_filename,
 
         "message":
             "Document uploaded successfully",
@@ -370,7 +386,6 @@ async def ask_question(
 
     global conversation_history
 
-
     # --------------------------------------------------------
     # CHECK DOCUMENT
     # --------------------------------------------------------
@@ -386,7 +401,6 @@ async def ask_question(
                 "Please upload a document first."
 
         }
-
 
     # --------------------------------------------------------
     # CHECK EMBEDDINGS
@@ -406,17 +420,34 @@ async def ask_question(
 
         }
 
-
     # ========================================================
     # QUESTION EMBEDDING
     # ========================================================
 
-    question_embedding = (
-        embedding_model.encode(
-            [question]
-        )[0]
-    )
+    try:
 
+        question_embedding = (
+            create_embeddings(
+                [question]
+            )[0]
+        )
+
+    except Exception as e:
+
+        print(
+            "Question embedding error:",
+            e
+        )
+
+        return {
+
+            "question":
+                question,
+
+            "answer":
+                "Unable to process the question."
+
+        }
 
     # ========================================================
     # COSINE SIMILARITY
@@ -424,23 +455,29 @@ async def ask_question(
 
     similarities = []
 
+    question_vector = np.array(
+        question_embedding
+    )
 
     for embedding in document_embeddings:
+
+        embedding_vector = np.array(
+            embedding
+        )
 
         denominator = (
 
             np.linalg.norm(
-                question_embedding
+                question_vector
             )
 
             *
 
             np.linalg.norm(
-                embedding
+                embedding_vector
             )
 
         )
-
 
         if denominator == 0:
 
@@ -451,8 +488,8 @@ async def ask_question(
             similarity = (
 
                 np.dot(
-                    question_embedding,
-                    embedding
+                    question_vector,
+                    embedding_vector
                 )
 
                 /
@@ -461,11 +498,9 @@ async def ask_question(
 
             )
 
-
         similarities.append(
             similarity
         )
-
 
     # ========================================================
     # TOP RELEVANT CHUNKS
@@ -476,11 +511,9 @@ async def ask_question(
         len(document_chunks)
     )
 
-
     top_indices = np.argsort(
         similarities
     )[-top_k:][::-1]
-
 
     relevant_chunks = [
 
@@ -489,7 +522,6 @@ async def ask_question(
         for i in top_indices
 
     ]
-
 
     # ========================================================
     # SOURCE PAGES
@@ -505,7 +537,6 @@ async def ask_question(
         )
     )
 
-
     # ========================================================
     # RAG CONTEXT
     # ========================================================
@@ -514,13 +545,11 @@ async def ask_question(
         relevant_chunks
     )
 
-
     # ========================================================
     # CONVERSATION CONTEXT
     # ========================================================
 
     previous_conversation = ""
-
 
     for item in conversation_history[-5:]:
 
@@ -533,7 +562,6 @@ async def ask_question(
             f"{item['answer']}\n\n"
 
         )
-
 
     # ========================================================
     # AI PROMPT
@@ -572,7 +600,6 @@ Instructions:
 Give a clear, concise and natural answer.
 """
 
-
     # ========================================================
     # OPENAI RESPONSE API
     # ========================================================
@@ -588,7 +615,6 @@ Give a clear, concise and natural answer.
         )
 
         answer = response.output_text
-
 
     except Exception as e:
 
@@ -607,7 +633,6 @@ Give a clear, concise and natural answer.
 
         }
 
-
     # ========================================================
     # SAVE CONVERSATION
     # ========================================================
@@ -621,7 +646,6 @@ Give a clear, concise and natural answer.
             answer
 
     })
-
 
     # ========================================================
     # FINAL RESPONSE
@@ -656,7 +680,6 @@ async def clear_chat():
     global conversation_history
 
     conversation_history = []
-
 
     return {
 
