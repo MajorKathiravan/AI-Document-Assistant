@@ -437,7 +437,7 @@
                     <h2>AI Assistant</h2>
 
                     <span>
-                        ● Local AI • Llama 3.2
+                        ● Cloud AI • OpenAI
                     </span>
 
                 </div>
@@ -499,7 +499,7 @@
 
     <div class="footer">
 
-        AI Document Assistant • FastAPI • RAG • Sentence Transformers • Ollama
+        AI Document Assistant • FastAPI • RAG • OpenAI • PyMuPDF
 
     </div>
 
@@ -554,7 +554,7 @@ async function uploadDocument() {
 
         const response =
             await fetch(
-                "http://127.0.0.1:8000/upload",
+                "/upload",
                 {
                     method: "POST",
                     body: formData
@@ -648,7 +648,7 @@ async function askQuestion() {
 
         const response =
             await fetch(
-                "http://127.0.0.1:8000/ask?question=" +
+                "/ask?question=" +
                 encodeURIComponent(question),
                 {
                     method: "POST"
@@ -816,7 +816,7 @@ async function clearChat() {
     try {
 
         await fetch(
-            "http://127.0.0.1:8000/clear-chat",
+            "/clear-chat",
             {
                 method: "POST"
             }
