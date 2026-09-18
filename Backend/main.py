@@ -1,9 +1,7 @@
-from dotenv import load_dotenv
 import os
-import numpy as np
 import shutil
-
-from openai import OpenAI
+import requests
+import numpy as np
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,9 +11,9 @@ import pymupdf
 import pytesseract
 
 
-# ============================================================
+# =========================================================
 # PATH CONFIGURATION
-# ============================================================
+# =========================================================
 
 BASE_DIR = os.path.dirname(
     os.path.dirname(
@@ -23,132 +21,177 @@ BASE_DIR = os.path.dirname(
     )
 )
 
-DOCUMENT_FOLDER = os.path.join(
-    BASE_DIR,
-    "Document"
-)
+DOCUMENT_FOLDER = os.path.join(BASE_DIR, "Document")
+FRONTEND_FILE = os.path.join(BASE_DIR, "Frontend", "index.html")
 
-FRONTEND_FILE = os.path.join(
-    BASE_DIR,
-    "Frontend",
-    "index.html"
-)
-
-os.makedirs(
-    DOCUMENT_FOLDER,
-    exist_ok=True
-)
+os.makedirs(DOCUMENT_FOLDER, exist_ok=True)
 
 
-# ============================================================
-# LOAD ENVIRONMENT
-# ============================================================
+# =========================================================
+# OLLAMA CONFIGURATION
+# =========================================================
 
-load_dotenv(
-    os.path.join(
-        BASE_DIR,
-        ".env"
-    )
-)
+OLLAMA_URL = "http://127.0.0.1:11434"
 
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY"
-)
-
-client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
+OLLAMA_MODEL = "llama3.2"
 
 
-# ============================================================
-# TESSERACT OCR
-# ============================================================
+# =========================================================
+# TESSERACT OCR CONFIGURATION
+# =========================================================
 
-windows_tesseract = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 if os.path.exists(windows_tesseract):
-
-    pytesseract.pytesseract.tesseract_cmd = (
-        windows_tesseract
-    )
+    pytesseract.pytesseract.tesseract_cmd = windows_tesseract
 
 
-# ============================================================
+# =========================================================
 # FASTAPI APPLICATION
-# ============================================================
+# =========================================================
 
 app = FastAPI(
     title="AI Document Assistant",
-    description="AI-powered document question answering system",
+    description="AI-powered document question answering system using RAG and Ollama",
     version="1.0.0"
 )
 
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
-# ============================================================
+# =========================================================
 # GLOBAL DOCUMENT DATA
-# ============================================================
+# =========================================================
 
 document_text = ""
 
 document_chunks = []
-
-document_embeddings = []
 
 document_page_numbers = []
 
 conversation_history = []
 
 
-# ============================================================
-# ROOT - SERVE FRONTEND
-# ============================================================
+# =========================================================
+# HOME PAGE
+# =========================================================
 
 @app.get("/")
 def root():
 
-    return FileResponse(
-        FRONTEND_FILE
-    )
+    return FileResponse(FRONTEND_FILE)
 
 
-# ============================================================
-# CREATE OPENAI EMBEDDINGS
-# ============================================================
+# =========================================================
+# CREATE LOCAL EMBEDDINGS
+# =========================================================
+#
+# We use a simple TF-IDF style semantic representation.
+# This avoids paid APIs and keeps the project lightweight.
+#
+# =========================================================
 
 def create_embeddings(texts):
 
     if not texts:
         return []
 
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=texts
-    )
+    vocabulary = {}
 
-    return [
-        item.embedding
-        for item in response.data
-    ]
+    tokenized_texts = []
+
+    for text in texts:
+
+        words = text.lower().split()
+
+        tokenized_texts.append(words)
+
+        for word in words:
+
+            word = word.strip(".,!?;:()[]{}\"'")
+
+            if word and word not in vocabulary:
+
+                vocabulary[word] = len(vocabulary)
 
 
-# ============================================================
+    embeddings = []
+
+    for words in tokenized_texts:
+
+        vector = np.zeros(len(vocabulary))
+
+        for word in words:
+
+            word = word.strip(".,!?;:()[]{}\"'")
+
+            if word in vocabulary:
+
+                vector[vocabulary[word]] += 1
+
+
+        # Normalize vector
+
+        norm = np.linalg.norm(vector)
+
+        if norm > 0:
+
+            vector = vector / norm
+
+
+        embeddings.append(vector.tolist())
+
+
+    return embeddings
+
+
+# =========================================================
+# OLLAMA CHAT FUNCTION
+# =========================================================
+
+def ask_ollama(prompt):
+
+    try:
+
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=180
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        return data.get(
+            "response",
+            "I could not generate an answer."
+        )
+
+    except Exception as e:
+
+        print("Ollama Error:", e)
+
+        return (
+            "Unable to connect to the local AI model. "
+            "Please make sure Ollama is running."
+        )
+
+
+# =========================================================
 # UPLOAD DOCUMENT
-# ============================================================
+# =========================================================
 
 @app.post("/upload")
 async def upload_document(
@@ -157,61 +200,51 @@ async def upload_document(
 
     global document_text
     global document_chunks
-    global document_embeddings
     global document_page_numbers
     global conversation_history
 
-    # --------------------------------------------------------
-    # Save Uploaded File
-    # --------------------------------------------------------
 
-    safe_filename = os.path.basename(
-        file.filename
-    )
+    # -----------------------------------------------------
+    # Save uploaded document
+    # -----------------------------------------------------
+
+    safe_filename = os.path.basename(file.filename)
 
     file_path = os.path.join(
         DOCUMENT_FOLDER,
         safe_filename
     )
 
-    with open(
-        file_path,
-        "wb"
-    ) as buffer:
+
+    with open(file_path, "wb") as buffer:
 
         content = await file.read()
 
-        buffer.write(
-            content
-        )
+        buffer.write(content)
 
-    # --------------------------------------------------------
+
+    # -----------------------------------------------------
     # Open PDF
-    # --------------------------------------------------------
+    # -----------------------------------------------------
 
-    document = pymupdf.open(
-        file_path
-    )
+    document = pymupdf.open(file_path)
 
-    # --------------------------------------------------------
-    # Reset Previous Data
-    # --------------------------------------------------------
 
     document_text = ""
 
     document_chunks = []
 
-    document_embeddings = []
-
     document_page_numbers = []
 
     conversation_history = []
 
-    # --------------------------------------------------------
-    # Extract Text Page By Page
-    # --------------------------------------------------------
 
     page_data = []
+
+
+    # -----------------------------------------------------
+    # Extract text page by page
+    # -----------------------------------------------------
 
     for page_number, page in enumerate(
         document,
@@ -220,9 +253,10 @@ async def upload_document(
 
         page_text = page.get_text()
 
-        # ----------------------------------------------------
-        # OCR FOR SCANNED PAGES
-        # ----------------------------------------------------
+
+        # -------------------------------------------------
+        # OCR fallback for scanned pages
+        # -------------------------------------------------
 
         if not page_text.strip():
 
@@ -235,31 +269,27 @@ async def upload_document(
 
                     pix = page.get_pixmap()
 
-                    image = pix.tobytes(
-                        "png"
-                    )
+                    image = pix.tobytes("png")
 
                     from PIL import Image
+
                     from io import BytesIO
 
                     img = Image.open(
                         BytesIO(image)
                     )
 
-                    page_text = (
-                        pytesseract.image_to_string(
-                            img
-                        )
+                    page_text = pytesseract.image_to_string(
+                        img
                     )
 
             except Exception as e:
 
-                print(
-                    "OCR Error:",
-                    e
-                )
+                print("OCR Error:", e)
+
 
         page_text = page_text.strip()
+
 
         if page_text:
 
@@ -274,38 +304,32 @@ async def upload_document(
                 page_text + "\n"
             )
 
-    # --------------------------------------------------------
-    # Page Count
-    # --------------------------------------------------------
 
-    pages = len(
-        document
-    )
+    pages = len(document)
 
     document.close()
 
-    # ========================================================
-    # CREATE PAGE-AWARE CHUNKS
-    # ========================================================
+
+    # =====================================================
+    # CHUNK DOCUMENT
+    # =====================================================
 
     chunk_size = 500
 
     chunk_overlap = 100
 
+
     for page_number, page_text in page_data:
 
         start = 0
 
+
         while start < len(page_text):
 
-            end = (
-                start +
-                chunk_size
-            )
+            end = start + chunk_size
 
-            chunk = page_text[
-                start:end
-            ].strip()
+            chunk = page_text[start:end].strip()
+
 
             if chunk:
 
@@ -317,67 +341,54 @@ async def upload_document(
                     page_number
                 )
 
+
             start += (
-                chunk_size -
-                chunk_overlap
+                chunk_size
+                - chunk_overlap
             )
 
-    # ========================================================
-    # CREATE OPENAI EMBEDDINGS
-    # ========================================================
 
-    if document_chunks:
+    # =====================================================
+    # CREATE LOCAL EMBEDDINGS
+    # =====================================================
 
-        try:
+    try:
 
-            document_embeddings = (
-                create_embeddings(
-                    document_chunks
-                )
-            )
+        document_embeddings = create_embeddings(
+            document_chunks
+        )
 
-        except Exception as e:
+    except Exception as e:
 
-            print(
-                "Embedding Error:",
-                e
-            )
+        print(
+            "Embedding Error:",
+            e
+        )
 
-            return {
-                "filename": safe_filename,
-                "message": "Document uploaded, but embedding creation failed.",
-                "error": str(e)
-            }
+        return {
+            "filename": safe_filename,
+            "message": "Document processing failed.",
+            "error": str(e)
+        }
 
-    # ========================================================
-    # RESPONSE
-    # ========================================================
 
     return {
 
-        "filename":
-            safe_filename,
+        "filename": safe_filename,
 
-        "message":
-            "Document uploaded successfully",
+        "message": "Document uploaded successfully",
 
-        "pages":
-            pages,
+        "pages": pages,
 
-        "chunks":
-            len(
-                document_chunks
-            ),
+        "chunks": len(document_chunks),
 
-        "text_preview":
-            document_text[:500]
-
+        "text_preview": document_text[:500]
     }
 
 
-# ============================================================
-# ASK QUESTION
-# ============================================================
+# =========================================================
+# QUESTION ANSWERING
+# =========================================================
 
 @app.post("/ask")
 async def ask_question(
@@ -386,51 +397,42 @@ async def ask_question(
 
     global conversation_history
 
-    # --------------------------------------------------------
-    # CHECK DOCUMENT
-    # --------------------------------------------------------
+
+    # -----------------------------------------------------
+    # Check document
+    # -----------------------------------------------------
 
     if not document_text:
 
         return {
 
-            "question":
-                question,
+            "question": question,
 
             "answer":
-                "Please upload a document first."
-
+            "Please upload a document first."
         }
 
-    # --------------------------------------------------------
-    # CHECK EMBEDDINGS
-    # --------------------------------------------------------
 
-    if len(
-        document_embeddings
-    ) == 0:
+    if not document_chunks:
 
         return {
 
-            "question":
-                question,
+            "question": question,
 
             "answer":
-                "Document embeddings are not available."
-
+            "Document content is not available."
         }
 
-    # ========================================================
-    # QUESTION EMBEDDING
-    # ========================================================
+
+    # -----------------------------------------------------
+    # Create question embedding
+    # -----------------------------------------------------
 
     try:
 
-        question_embedding = (
-            create_embeddings(
-                [question]
-            )[0]
-        )
+        question_embedding = create_embeddings(
+            [question]
+        )[0]
 
     except Exception as e:
 
@@ -441,17 +443,16 @@ async def ask_question(
 
         return {
 
-            "question":
-                question,
+            "question": question,
 
             "answer":
-                "Unable to process the question."
-
+            "Unable to process the question."
         }
 
-    # ========================================================
-    # COSINE SIMILARITY
-    # ========================================================
+
+    # =====================================================
+    # SEMANTIC SIMILARITY
+    # =====================================================
 
     similarities = []
 
@@ -459,61 +460,67 @@ async def ask_question(
         question_embedding
     )
 
-    for embedding in document_embeddings:
 
-        embedding_vector = np.array(
-            embedding
+    for chunk in document_chunks:
+
+        chunk_embedding = create_embeddings(
+            [chunk]
+        )[0]
+
+        chunk_vector = np.array(
+            chunk_embedding
         )
 
-        denominator = (
 
-            np.linalg.norm(
-                question_vector
-            )
+        # Different vocabulary sizes can occur,
+        # therefore calculate lexical similarity
+        # separately below.
 
-            *
-
-            np.linalg.norm(
-                embedding_vector
-            )
-
+        question_words = set(
+            question.lower().split()
         )
 
-        if denominator == 0:
+        chunk_words = set(
+            chunk.lower().split()
+        )
+
+
+        if not question_words:
 
             similarity = 0
 
         else:
 
-            similarity = (
-
-                np.dot(
-                    question_vector,
-                    embedding_vector
-                )
-
-                /
-
-                denominator
-
+            common_words = (
+                question_words
+                .intersection(chunk_words)
             )
+
+            similarity = (
+                len(common_words)
+                / len(question_words)
+            )
+
 
         similarities.append(
             similarity
         )
 
-    # ========================================================
-    # TOP RELEVANT CHUNKS
-    # ========================================================
+
+    # =====================================================
+    # RETRIEVE TOP CHUNKS
+    # =====================================================
 
     top_k = min(
         3,
         len(document_chunks)
     )
 
+
     top_indices = np.argsort(
         similarities
     )[-top_k:][::-1]
+
 
     relevant_chunks = [
 
@@ -523,156 +530,108 @@ async def ask_question(
 
     ]
 
-    # ========================================================
-    # SOURCE PAGES
-    # ========================================================
 
     source_pages = sorted(
         set(
-
             document_page_numbers[i]
-
             for i in top_indices
-
         )
     )
 
-    # ========================================================
-    # RAG CONTEXT
-    # ========================================================
 
     context = "\n\n".join(
         relevant_chunks
     )
 
-    # ========================================================
-    # CONVERSATION CONTEXT
-    # ========================================================
+
+    # =====================================================
+    # CONVERSATION MEMORY
+    # =====================================================
 
     previous_conversation = ""
+
 
     for item in conversation_history[-5:]:
 
         previous_conversation += (
 
-            f"User: "
-            f"{item['question']}\n"
+            f"User: {item['question']}\n"
 
-            f"Assistant: "
-            f"{item['answer']}\n\n"
+            f"Assistant: {item['answer']}\n\n"
 
         )
 
-    # ========================================================
-    # AI PROMPT
-    # ========================================================
+
+    # =====================================================
+    # RAG PROMPT
+    # =====================================================
 
     prompt = f"""
 You are an AI Document Assistant.
 
-You have access to:
-
-1. Relevant document context
-2. Previous conversation
+Your task is to answer questions using the provided document context.
 
 Previous conversation:
-
 {previous_conversation}
 
 Relevant document context:
-
 {context}
 
 Current user question:
-
 {question}
 
 Instructions:
 
-- Answer document questions using the relevant document context.
-- Use previous conversation when the user refers to earlier questions.
-- Use both sources when both are relevant.
+- Answer using the document context.
+- Use previous conversation when relevant.
 - Do not invent information.
 - Do not use outside knowledge for document-specific questions.
-- If the required information is unavailable, say:
-"I could not find the answer."
-
-Give a clear, concise and natural answer.
+- If the answer cannot be found in the document, say:
+"I could not find the answer in the document."
+- Give a clear and concise answer.
 """
 
-    # ========================================================
-    # OPENAI RESPONSE API
-    # ========================================================
 
-    try:
+    # =====================================================
+    # GENERATE ANSWER USING OLLAMA
+    # =====================================================
 
-        response = client.responses.create(
+    answer = ask_ollama(
+        prompt
+    )
 
-            model="gpt-4o-mini",
 
-            input=prompt
+    # =====================================================
+    # SAVE CONVERSATION
+    # =====================================================
 
-        )
+    conversation_history.append(
 
-        answer = response.output_text
-
-    except Exception as e:
-
-        print(
-            "OpenAI Error:",
-            e
-        )
-
-        return {
-
-            "question":
-                question,
-
-            "answer":
-                "OpenAI connection failed. Please check your API configuration."
-
+        {
+            "question": question,
+            "answer": answer
         }
 
-    # ========================================================
-    # SAVE CONVERSATION
-    # ========================================================
+    )
 
-    conversation_history.append({
-
-        "question":
-            question,
-
-        "answer":
-            answer
-
-    })
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
 
     return {
 
-        "question":
-            question,
+        "question": question,
 
-        "answer":
-            answer,
+        "answer": answer,
 
-        "source_pages":
-            source_pages,
+        "source_pages": source_pages,
 
-        "retrieved_chunks":
-            len(
-                relevant_chunks
-            )
-
+        "retrieved_chunks": len(
+            relevant_chunks
+        )
     }
 
 
-# ============================================================
+# =========================================================
 # CLEAR CHAT
-# ============================================================
+# =========================================================
 
 @app.post("/clear-chat")
 async def clear_chat():
@@ -681,9 +640,9 @@ async def clear_chat():
 
     conversation_history = []
 
+
     return {
 
         "message":
-            "Chat history cleared successfully"
-
+        "Chat history cleared successfully"
     }
